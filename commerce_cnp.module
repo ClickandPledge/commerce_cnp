@@ -1,0 +1,2042 @@
+<?php
+
+/**
+ * @file
+ * Implements ClickandPledge payment services for use in Drupal Commerce.
+ */
+
+// ClickandPledge transaction mode definitions:
+define('CNP_TXN_MODE_LIVE', 'production');
+define('CNP_TXN_MODE_TEST', 'test');
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function commerce_cnp_commerce_payment_method_info() {
+  $payment_methods = array();
+
+  $payment_methods['cnp_aim'] = array(
+    'base' => 'commerce_cnp',
+    'title' => t('ClickandPledge payment processor'),
+    'short_title' => t('ClickandPledge Payment'),
+    'display_title' => t('Credit Card - ClickandPledge'),
+    'description' => t('Integrates ClickandPledge Payment Processor transactions.'),
+    'cardonfile' => array(
+      'update callback' => 'commerce_cnp_cardonfile_update',
+      'delete callback' => 'commerce_cnp_cardonfile_delete',
+    ),
+  );
+  return $payment_methods;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function commerce_cnp_form_commerce_payment_order_transaction_add_form_alter(&$form, &$form_state) {
+  // If the payment terminal is displayed for an commerce_cnp transaction...
+  if (!empty($form['payment_terminal']) && $form_state['payment_method']['method_id'] == 'cnp_aim') {
+  // Add a txn_from to know the transaction processing by admin, than the payment method's default.
+  $form['payment_terminal']['payment_details']['txn_from'] = array(
+    '#type' => 'hidden',
+    '#value' => 'adminpayment',
+  );
+  }
+}
+
+/**
+ * Returns the default settings for the ClickandPledge payment method.
+ */
+function commerce_cnp_default_settings() {
+  return array(
+    'account_id' => '',
+    'account_guid' => '',
+    'organization_information' => '',
+    'thankyou_message' => '',
+    'terms_condition' => '',
+    'order_mode' => CNP_TXN_MODE_TEST,
+    'is_recurring' => FALSE,
+    'periodicity' => array( 'Year' ),
+    'recurring_method' => array( 'Installment' ),
+    'indefinite' => array( FALSE ),
+    'transaction_type' => 'Payment',
+    'cnp_cardonfile' => FALSE,
+    'email_customer' => TRUE,
+    'card_types' => array('visa'),
+  );
+}
+
+/**
+ * Payment method callback: settings form.
+ */
+function commerce_cnp_settings_form($settings = NULL) {
+  module_load_include('inc', 'commerce_payment', 'includes/commerce_payment.credit_card');
+
+  // Merge default settings into the stored settings array.
+  $settings = (array) $settings + commerce_cnp_default_settings();
+  $form = array();
+  $form['account_id'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Account ID'),
+    '#maxlength' => 10,
+    '#description' => t('Trio account number.'),
+    '#default_value' => $settings['account_id'],
+    '#required' => TRUE,
+  );
+  $form['account_guid'] = array(
+    '#type' => 'textfield',
+    '#title' => t('API Account GUID'),
+    '#maxlength' => 36,
+    '#description' => t('A unique identifier provided by ClickandPledge:  Listed in the administrative system.'),
+    '#default_value' => $settings['account_guid'],
+    '#required' => TRUE,
+  );
+
+
+  $form['organization_information'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Organization information'),
+    '#maxlength' => 1500,
+    '#cols' => 20,
+    '#description' => t('Organization information to be used.'),
+    '#default_value' => $settings['organization_information'],
+    '#required' => TRUE,
+  );
+
+  $form['thankyou_message'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Thank you message'),
+    '#maxlength' => 500,
+    '#description' => t('The Thank You message appearing after the salutation.'),
+    '#default_value' => $settings['thankyou_message'],
+    '#required' => FALSE,
+  );
+
+  $form['terms_condition'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Terms & conditions'),
+    '#maxlength' => 1500,
+    '#description' => t('The terms & conditions to be added at the bottom of the receipt.  Typically the text provides proof that the patron has read the terms & conditions and has agreed to it.'),
+    '#default_value' => $settings['terms_condition'],
+    '#required' => FALSE,
+  );
+
+  $form['card_types'] = array(
+    '#type' => 'checkboxes',
+    '#title' => t('Limit accepted credit cards to the following types'),
+    '#description' => t('If you want to limit acceptable card types, you should only select those supported by your merchant account.') . '<br />' . t('If none are checked, any credit card type will be accepted. If you dont select any card, it will display all cards in front end.'),
+    '#options' => array(
+      'visa' => 'Visa',
+      'mastercard' => 'MasterCard',
+      'amex' => 'American Express',
+      'jcb' => 'JCB',
+      'discover' => 'Discover Card',
+    ),
+    '#default_value' => $settings['card_types'],
+    '#required' => TRUE,
+  );
+
+  $form['email_customer'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Tell ClickandPledge to e-mail the customer a receipt based on your account settings.'),
+    '#default_value' => $settings['email_customer'],
+  );
+
+  if (module_exists('commerce_cardonfile')) {
+    // Enable Card on File functionality with this payment method using ClickandPledge
+    $form['cnp_cardonfile'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Enable Card on File functionality with this payment method using ClickandPledge'),
+      '#default_value' => $settings['cnp_cardonfile'],
+    );
+  }
+
+  $form['order_mode'] = array(
+    '#type' => 'radios',
+    '#title' => t('Transaction mode'),
+    '#description' => t('Specify the order mode. Test mode may be used for testing and development.  In test mode only test credit card numbers may be used.  In Production mode transactions are only performed with real credit cards.'),
+    '#options' => array(
+      CNP_TXN_MODE_LIVE => t('Live transactions'),
+      CNP_TXN_MODE_TEST => t('Test transactions'),
+    ),
+    '#default_value' => $settings['order_mode'],
+  );
+
+  // Recurring Elements
+  $form['is_recurring'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Recurring contributions.'),
+    '#default_value' => $settings['is_recurring'],
+  );
+
+  $form['periodicity'] = array(
+    '#type' => 'checkboxes',
+    '#title' => t('Supported recurring periods'),
+    '#options' => array(
+      'Week' => t('Week'),
+      '2 Weeks' => t('2 Weeks'),
+      'Month' => t('Month'),
+      '2 Months' => t('2 Months'),
+      'Quarter' => t('Quarter'),
+      '6 Months' => t('6 Months'),
+      'Year' => t('Year'),
+    ),
+    '#default_value' => $settings['periodicity'],
+    '#description' => t('If you dont select any periodicity, It will display all options in front end.'),
+  );
+
+  $form['recurring_method'] = array(
+    '#type' => 'checkboxes',
+    '#title' => t('Recurring method'),
+    '#description' => t('The recurring method used.  The value will ONLY be used for reporting.'),
+    '#options' => array(
+      'Installment' => t('Installment (example: Split $1000 into 10 payments of $100 each)
+    '),
+    'Subscription' => t('Subscription (example: Pay $10 every month for 20 times)
+    '),
+    ),
+    '#default_value' => $settings['recurring_method'],
+  );
+
+  $form['indefinite'] = array(
+    '#type' => 'checkboxes',
+    '#id' => 'indefinite',
+    '#title' => t('Enable indefinite recurring'),
+    '#options' => array(
+      'indefinite' => t('Indefinite'),
+    ),
+    '#default_value' => $settings['indefinite'],
+  );
+  $form['#attached']['js'] = array(drupal_get_path('module', 'commerce_cnp') . '/includes/js/recurring_behaviors_admin.js' => array('scope' => 'footer'), );
+  return $form;
+}
+
+/**
+ * Payment method callback: checkout form.
+ */
+function commerce_cnp_submit_form($payment_method, $pane_values, $checkout_pane, $order) {
+  module_load_include('inc', 'commerce_payment', 'includes/commerce_payment.credit_card');
+  // Add a field for the credit card owner if specified.
+  $fields = array(
+    'code' => '',
+    'owner' => ''
+  );
+
+  // Add the credit card types array if necessary.
+  if ( isset( $payment_method['settings']['card_types'] ) && count( $payment_method['settings']['card_types'] ) > 0 ) {
+    $card_types = array_diff(array_values($payment_method['settings']['card_types']), array(0));
+  }
+  else {
+  $card_types_array = array(
+    'visa' => 'Visa',
+    'mastercard' => 'MasterCard',
+    'amex' => 'American Express',
+    'jcb' => 'JCB',
+    'discover' => 'Discover Card',
+  );
+  $card_types = array_diff(array_values( $card_types_array ), array(0));
+  }
+
+  if ( count($card_types) > 0 ) {
+    $fields['type'] = $card_types;
+  }
+
+  // Recurring Fields
+  if (  isset( $payment_method['settings']['is_recurring'] ) && $payment_method['settings']['is_recurring'] ) {
+    $periods = array_diff(array_values($payment_method['settings']['periodicity']), array(0));
+    $period_select = '<select name="commerce_payment[payment_details][other][periodicity]" id="commerce_payment[payment_details][other][periodicity]">';
+    if ( count( $periods ) > 0 ) {
+      foreach ( $periods as $key => $value )
+        $periodicity[$value] = $value;
+        $period_select .= '<option value="' . $value . '">' . $value . '</option>';
+    }
+    $period_select .= '</select>';
+
+    $fields2['is_recurring'] = array(
+      '#type' => 'radios',
+      '#title' => t('Payment options'),
+      '#options' => array(
+        'onetime' => 'I want to make a one-time payment.',
+        'recurring' => 'I want to make a recurring payment.',
+      ),
+      '#default_value' => 'onetime',
+      '#tree' => TRUE,
+    );
+
+    $recurring_methods = array_diff(array_values($payment_method['settings']['recurring_method']), array(0));
+
+    if ( count( $recurring_methods ) > 0 ) {
+      foreach ( $recurring_methods as $key => $value ) {
+        if ( $value == 'Installment' ) {
+          $recurring_methods_array[$value] = 'Installment (example: Split $1000 into 10 payments of $100 each)';
+        }
+        if ( $value == 'Subscription' ) {
+          $recurring_methods_array[$value] = 'Subscription (example: Pay $10 every month for 20 times)';
+        }
+      }
+    }
+
+  if ( count( $recurring_methods_array ) > 1 ) {
+    $fields2['recurring_method'] = array(
+      '#type' => 'radios',
+      '#title' => t('Recurring method'),
+      '#options' => $recurring_methods_array,
+      '#default_value' => 'Installment',
+      '#tree' => TRUE,
+    );
+  }
+  else {
+    foreach ( $recurring_methods as $key => $value ) {
+      if ( $value == 'Installment' ) {
+        $recurring_method = $value;
+        $recurring_method_desc = 'Installment (example: Split $1000 into 10 payments of $100 each)';
+      }
+      if ( $value == 'Subscription' ) {
+        $recurring_method = $value;
+        $recurring_method_desc = 'Subscription (example: Pay $10 every month for 20 times)';
+      }
+    }
+
+    $fields2['recurring_method_description'] = array(
+      '#type' => 'item',
+      '#title' => t('Recurring Method selected for this transaction is'),
+      '#markup' => $recurring_method_desc,
+      '#id' => 'cnp_recurring_method_description',
+    );
+
+    $fields2['recurring_method'] = array(
+      '#type' => 'hidden',
+      '#title' => t('for'),
+      '#maxlength' => 3,
+      '#size' => 3,
+      '#value' => $recurring_method
+    );
+  }
+
+  if ( isset( $payment_method['settings']['indefinite'] ) && $payment_method['settings']['indefinite']['indefinite'] != '0' ) {
+    $fields2['indefinite'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('I want to pay this amount indefinitely'),
+      '#id' => 'cnp_indefinite',
+    );
+  }
+
+  $periods = array_diff(array_values($payment_method['settings']['periodicity']), array(0));
+
+  if ( count( $periods ) > 0 ) {
+    $periodicity = array( '' => 'Select period' );
+    foreach ( $periods as $key => $value ) {
+      $periodicity[$value] = $value;
+    }
+  }
+  else {
+    $periods = array(
+      'Week' => t('Week'),
+      '2 Weeks' => t('2 Weeks'),
+      'Month' => t('Month'),
+      '2 Months' => t('2 Months'),
+      'Quarter' => t('Quarter'),
+      '6 Months' => t('6 Months'),
+      'Year' => t('Year'),
+    );
+  $periodicity = array( '' => 'Select period' );
+    foreach ( $periods as $key => $value ) {
+      $periodicity[$value] = $value;
+    }
+  }
+
+  $temp = array(
+    '#type' => 'textfield',
+    '#field_prefix' => t('for'),
+    '#maxlength' => 3,
+    '#size' => 3,
+    '#field_suffix' => t('&nbsp;times')
+  );
+
+  $fields2['periodicity'] = array(
+    '#type' => 'select',
+    '#field_prefix' => t('every'),
+    '#options' => $periodicity,
+  );
+
+  $fields2['installments'] = array(
+    '#type' => 'textfield',
+    '#field_prefix' => t('for'),
+    '#maxlength' => 3,
+    '#size' => 3,
+    '#field_suffix' => t('&nbsp;times'),
+    '#id' => 'cnp_installments',
+  );
+
+  drupal_add_js('jQuery("input:radio[value=onetime]").checked = true;', array('type' => 'inline', 'scope' => 'footer', 'weight' => 5));
+
+  $fields2['#attached']['js'] = array(drupal_get_path('module', 'commerce_cnp') . '/includes/js/recurring_behaviors.js' => array('scope' => 'footer'), );
+
+  }
+
+  $fieldstodisplay['credit_card'] = commerce_payment_credit_card_form($fields);
+  if ( isset( $fields2 ) && count( $fields2 ) > 0 ) {
+    $fieldstodisplay['other'] = $fields2;
+  }
+  return $fieldstodisplay;
+}
+
+/**
+ * Payment method callback: checkout form validation.
+ */
+function commerce_cnp_submit_form_validate($payment_method, $pane_form, $pane_values, $order, $form_parents = array()) {
+  // If the customer specified a card on file, skip the normal validation.
+  $is_card_on_file = module_exists('commerce_cardonfile') && !empty($payment_method['settings']['cnp_cardonfile']) &&
+    !empty($pane_values['cardonfile']) && $pane_values['cardonfile'] !== 'new';
+  if ( $is_card_on_file ) {
+    if ( isset( $pane_values['other'] ) && $pane_values['other']['is_recurring'] == 'recurring' ) {
+      // Validate the Recurring Options.
+      $settings = array(
+        'form_parents' => array_merge($form_parents, array('other')),
+      );
+      if ( ( !commerce_cnp_validate_recurring($pane_values['other'], $settings) ) ) {
+        return FALSE;
+      }
+    }
+    return;
+  }
+
+  module_load_include('inc', 'commerce_payment', 'includes/commerce_payment.credit_card');
+
+  // Validate the credit card fields.
+  $settings = array(
+    'form_parents' => array_merge($form_parents, array('credit_card')),
+  );
+
+  if ( isset( $pane_values['other'] ) && $pane_values['other']['is_recurring'] == 'recurring' ) {
+    // Validate the Recurring Options.
+    $settings = array(
+      'form_parents' => array_merge($form_parents, array('other')),
+    );
+
+    if ( ( !commerce_cnp_validate_recurring($pane_values['other'], $settings) ) || ( !commerce_payment_credit_card_validate($pane_values['credit_card']['credit_card'], $settings) )) {
+      return FALSE;
+    }
+  }
+  else {
+    if (!commerce_payment_credit_card_validate($pane_values['credit_card']['credit_card'], $settings)) {
+      return FALSE;
+    }
+  }
+}
+
+/**
+* Payment method callback: checkout form validation if admin enabled recurring.
+*/
+function commerce_cnp_validate_recurring( $details, $settings ) {
+  $valid = TRUE;
+
+  $prefix = isset( $settings['form_parents'] ) ? implode('][', $settings['form_parents']) . '][' : '';
+
+  if ( isset( $details['periodicity'] ) ) {
+    if (  empty( $details['periodicity'] )  ) {
+      form_set_error($prefix . 'periodicity', t('Please select periodicity.'));
+      $valid = FALSE;
+    }
+    if ( !in_array( $details['periodicity'], array( 'Week', '2 Weeks', 'Month', '2 Months', 'Quarter', '6 Months', 'Year' ) )) {
+      form_set_error($prefix . 'periodicity', t('Please select valid periodicity.'));
+      $valid = FALSE;
+    }
+  }
+
+  if ( ( isset( $details['indefinite'] ) && $details['indefinite'] == 0 ) || !isset( $details['indefinite'] )  ) {
+    if (  empty( $details['installments'] )  ) {
+      form_set_error($prefix . 'installments', t('Please enter the number of times a payment will be replicated.'));
+      $valid = FALSE;
+    }
+
+    if (  !preg_match( '/^\d{1,3}$/', $details['installments'] )  ) {
+      if ( $details['recurring_method'] == 'Installment' ) {
+        form_set_error($prefix . 'installments', t('Please enter valid Installments. The value should be between 2 to 998'));
+      }
+      else {
+        form_set_error($prefix . 'installments', t('Please enter valid Installments. The value should be between 2 to 999'));
+      }
+      $valid = FALSE;
+    }
+
+    /*
+    Check whether the installments field in the values and it is less than one as Click & Pledge allowed values for Installments are 2 to 999 only.
+    */
+    $min_stallments = ( isset( $details['installments'] ) && $details['installments'] <= 1 && $details['installments'] != '' );
+    /*
+    Check whether the installments field in the values and it is not greater than 999 as Click & Pledge allowed values for Installments are 2 to 999 only. For recurring_method 'Installment' It will accepts values between 2 to 998.
+    */
+    $max_stallments = ( isset( $details['installments'] ) && $details['installments'] >= 999 && $details['installments'] != '' && $details['recurring_method'] == 'Installment'  );
+    if ( $min_stallments || $max_stallments ) {
+       if ( $details['recurring_method'] == 'Installment' ) {
+        form_set_error($prefix . 'installments', t('Please enter valid Installments. The value should be between 2 to 998'));
+       }
+       else {
+         form_set_error($prefix . 'installments', t('Please enter valid Installments. The value should be between 2 to 999'));
+       }
+        $valid = FALSE;
+    }
+
+    /*
+    Check whether the installments field in the values and it is not greater than 999 as Click & Pledge allowed values for Installments are 2 to 999 only. For recurring_method 'Subscription' It will accepts values between 2 to 999.
+    */
+    $max_stallments_subscription = ( isset( $details['installments'] ) && $details['installments'] >= 1000 && $details['installments'] != ''  );
+    if ( $min_stallments || $max_stallments_subscription ) {
+      if ( $details['recurring_method'] == 'Installment' ) {
+        form_set_error($prefix . 'installments', t('Please enter valid Installments. The value should be between 2 to 998'));
+      }
+      else {
+        form_set_error($prefix . 'installments', t('Please enter valid Installments. The value should be between 2 to 999'));
+      }
+      $valid = FALSE;
+    }
+  }
+  return $valid;
+}
+
+/**
+ * Payment method callback: checkout form submission.
+ * @param object $payment_method
+ * @param object $pane_form
+ * @param object $pane_values
+ * @param $order
+ * The order the transaction is on.
+ * @param array $charge
+ * The price array for the charge amount with keys of 'amount' and 'currency'.
+ */
+function commerce_cnp_submit_form_submit($payment_method, $pane_form, $pane_values, $order, $charge) {
+
+  if ( !in_array( commerce_default_currency(), array('USD', 'EUR', 'CAD', 'GBP') ) ) {
+    drupal_set_message(t('We are not supporting the currency you working. Please contact administrator.'), 'error');
+    drupal_set_message(check_plain( 'You are using the currency ' . commerce_default_currency() . ' which is not supported by ClickandPledge' ), 'error');
+    return FALSE;
+  }
+
+ // Determine the credit card type if possible for use in later code.
+ $card_type = '';
+  if (!empty($pane_values['credit_card']['credit_card']['number'])) {
+    module_load_include('inc', 'commerce_payment', 'includes/commerce_payment.credit_card');
+    $card_type = commerce_payment_validate_credit_card_type($pane_values['credit_card']['credit_card']['number'], array_keys(commerce_payment_credit_card_types()));
+  }
+  elseif ( isset( $pane_values['cardonfile'] ) && $pane_values['cardonfile'] != '') {
+    $stored_card_data = commerce_cardonfile_load( $pane_values['cardonfile'] );
+    // $stored_cards = commerce_cardonfile_load_multiple_by_uid($order->uid, $payment_method['instance_id']);
+    $card_type = $stored_card_data->card_type;
+  }
+
+  if ( !in_array( $card_type, $pane_values['credit_card']['credit_card']['valid_types'] ) ) {
+    drupal_set_message(t('We are not supporting the selected credit card. Please contact administrator.'), 'error');
+    drupal_set_message(check_plain( 'You are using the card of type ' . $card_type . ' which is not supported by Administrator' ), 'error');
+    return FALSE;
+  }
+
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $billing_address = $order_wrapper->commerce_customer_billing->commerce_customer_address->value();
+
+  if ( $billing_address['name_line'] != '' ) {
+    $nameparts = explode(' ', $billing_address['name_line']);
+    if ( count($nameparts) < 2 ) {
+      drupal_set_message(t('You have entered wrong full name'), 'error');
+      drupal_set_message(check_plain( 'Please enter Your Billing Full name as Firstname space Lastname in checkout page.' ), 'error');
+      return FALSE;
+    }
+  }
+
+  if (module_exists('commerce_shipping') && $order_wrapper->commerce_customer_shipping->value()) {
+    $shipping_address = $order_wrapper->commerce_customer_shipping->commerce_customer_address->value();
+    if (empty($shipping_address['first_name'])) {
+      $name_parts = explode(' ', $shipping_address['name_line']);
+      if ( count($name_parts) < 2 ) {
+        drupal_set_message(t('You have entered wrong full name'), 'error');
+        drupal_set_message(check_plain( 'Please enter Your Shipping Full name as Firstname space Lastname in checkout page.' ), 'error');
+        return FALSE;
+      }
+    }
+  }
+
+  // If the customer specified payment using a card on file, attempt that now and simply return the result.
+  if (module_exists('commerce_cardonfile') && isset($payment_method['settings']['cnp_cardonfile']) && $payment_method['settings']['cnp_cardonfile'] &&
+    !empty($pane_values['cardonfile']) && $pane_values['cardonfile'] !== 'new') {
+    return commerce_cnp_cim_submit_form_submit($payment_method, $pane_form, $pane_values, $order, $charge);
+  }
+
+
+  if ( isset( $pane_values['txn_from'] ) && $pane_values['txn_from'] == 'adminpayment' ) {
+    $prepared_xml_array = commerce_cnp_buildxml_admin( $payment_method, $pane_form, $pane_values, $order, $charge );
+  }
+  else {
+    $prepared_xml_array = commerce_cnp_buildxml( $payment_method, $pane_form, $pane_values, $order, $charge );
+  }
+
+  $prepared_xml = $prepared_xml_array['xml'];
+  // echo $prepared_xml;
+  // die();
+  // Submit the request to ClickandPledge.
+  $cpresponse = commerce_cnp_request( $prepared_xml );
+
+  if (($cpresponse === FALSE)) {
+    $message =  t('Error: Connection to payment gateway failed - no data returned.');
+  }
+  $result_code = $cpresponse->OperationResult->ResultCode;
+  $transaction_number = $cpresponse->OperationResult->TransactionNumber;
+  $response_message = $cpresponse->OperationResult->ResultCode . ':' . $cpresponse->OperationResult->AdditionalInfo;
+  // Prepare a transaction object to log the API response.
+  $transaction = commerce_payment_transaction_new('cnp_aim', $order->order_id);
+  $transaction->instance_id = $payment_method['instance_id'];
+  if ( isset( $pane_values['txn_from'] ) && $pane_values['txn_from'] == 'adminpayment' ) {
+    $transaction->amount = $prepared_xml_array['totalcharged'];
+  }
+  else {
+    $transaction->amount = $charge['amount'];
+  }
+  $transaction->currency_code = $charge['currency_code'];
+  $transaction->payload[REQUEST_TIME] = $cpresponse;
+
+  $responsecodes = commerce_cnp_response_codes();
+
+  // If we didn't get an approval response code...
+  if ($result_code != '0') {
+    if ( in_array( $result_code, array( 2051, 2052, 2053 ) ) ) {
+      $additional_info = $cpresponse->OperationResult->AdditionalInfo;
+    }
+    else {
+      if ( isset( $responsecodes[$result_code] ) ) {
+          $additional_info = $responsecodes[$result_code];
+      }
+      else {
+          $additional_info = 'Unknown error';
+      }
+    }
+
+    $response_message = $result_code . ':' . $additional_info;
+    // Create a failed transaction with the error message.
+    $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+    $transaction->remote_status = COMMERCE_PAYMENT_STATUS_FAILURE;
+    $transaction->message = t( check_plain( $response_message ) );
+    // Log the trouble string to the watchdog.
+    watchdog('commerce_cnp', $response_message, array(), WATCHDOG_ERROR);
+  }
+  else {
+    $vault_guid = $cpresponse->OperationResult->VaultGUID;
+    $transaction->remote_id = $vault_guid;
+    /*
+    Check whether recurring variable is set or not
+    */
+    $recurring_check = ( isset( $payment_method['settings']['is_recurring'] ) );
+
+    /*
+    Check whether admin enables recurring or not
+    */
+    $recurring_enable_check = ( $payment_method['settings']['is_recurring'] == 0 );
+
+    /*
+    Check whether option selected by user is not 'I want to make a recurring payment'
+    */
+    $other_check = ( isset( $pane_values['other'] ) && $pane_values['other']['is_recurring'] == 'recurring' );
+    if ( ( $recurring_check ) && ( $other_check ) ) {
+      $transaction->message = t( check_plain( $cpresponse->OperationResult->ResultData ) . '<br>This is recurring payment' );
+    }
+    else {
+      $transaction->message = t( check_plain( $cpresponse->OperationResult->ResultData ) );
+    }
+
+    // For now we are not supporting 'Authorize'
+    $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+    $transaction->remote_status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+  }
+
+  // Save the transaction information.
+  commerce_payment_transaction_save($transaction);
+
+  // If the payment failed, display an error and rebuild the form.
+  if ($result_code != '0') {
+    drupal_set_message(t('We received the following error processing your card. Please enter you information again or try a different card.'), 'error');
+    drupal_set_message(check_plain( $response_message ), 'error');
+    return FALSE;
+  }
+
+  // If Card on File storage is enabled via CnP and the form says to store data...
+  if (module_exists('commerce_cardonfile') && !empty($payment_method['settings']['cnp_cardonfile']) &&
+    !empty($pane_values['credit_card']['cardonfile_store']) && $pane_values['credit_card']['cardonfile_store'] && $result_code == '0') {
+    // Build a payment details array for the credit card.
+    $payment_details = array(
+        'cardNumber' => $pane_values['credit_card']['credit_card']['number'],
+        'expirationDate' => $pane_values['credit_card']['credit_card']['exp_year'] . '-' . $pane_values['credit_card']['credit_card']['exp_month'],
+    );
+
+    if (isset($pane_values['credit_card']['credit_card']['code'])) {
+      $payment_details['cardCode'] = $pane_values['credit_card']['credit_card']['code'];
+    }
+
+    // First look to see if we already have cards on file for the user.
+    //$stored_cards = commerce_cardonfile_data_load_multiple($order->uid, $payment_method['instance_id']);
+    $stored_cards = commerce_cardonfile_load_multiple_by_uid($order->uid, $payment_method['instance_id']);
+
+    //$stored_cards = commerce_cardonfile_load();
+    $storecard = TRUE;
+
+    // If we didn't find any, attempt to make a new Customer Profile now.
+    if (empty($stored_cards)) {
+      if ($result_code == '0') {
+        $remote_id = (string) $order->uid . '|' . (string) $vault_guid . '|' . $payment_method['settings']['account_id'] . '|' . $transaction_number;
+
+        $card_data = commerce_cardonfile_new();
+        $card_data->uid = $order->uid;
+        $card_data->payment_method = $payment_method['method_id'];
+        $card_data->instance_id = $payment_method['instance_id'];
+        $card_data->remote_id = $remote_id;
+        $card_data->card_type = !empty($card_type) ? $card_type : 'card';
+        $card_data->card_name = !empty($billing_address['name_line']) ? $billing_address['name_line'] : '';
+        $card_data->card_number = substr($pane_values['credit_card']['credit_card']['number'], -4);
+        $card_data->card_exp_month = $pane_values['credit_card']['credit_card']['exp_month'];
+        $card_data->card_exp_year = $pane_values['credit_card']['credit_card']['exp_year'];
+        $card_data->status = 1;
+
+        // Save and log the creation of the new card on file.
+        commerce_cardonfile_save( $card_data );
+        watchdog('commerce_cnp', 'ClickandPledge Customer Profile @profile_id created and saved to user @uid.', array('@profile_id' => $card_data->card_name, '@uid' => $order->uid));
+      }
+    }
+    else {
+      // Check whether the card is already exist
+      foreach ( $stored_cards as $newcard ) {
+        if ( ($newcard->uid == $order->uid) && ($newcard->card_exp_year == $pane_values['credit_card']['credit_card']['exp_year']) && ( $newcard->card_exp_month == $pane_values['credit_card']['credit_card']['exp_month']) && ( $newcard->card_number ==  substr($pane_values['credit_card']['credit_card']['number'], -4)) ) {
+          $storecard = FALSE;
+        }
+      }
+    }
+
+    // Attempt to add the card to an existing Customer Profile if specified.
+    if ( $storecard && $result_code == '0' ) {
+      $remote_id = (string) $order->uid . '|' . (string) $vault_guid . '|' . $payment_method['settings']['account_id'] . '|' . $transaction_number;
+
+      $card_data = commerce_cardonfile_new();
+      $card_data->uid = $order->uid;
+      $card_data->payment_method = $payment_method['method_id'];
+      $card_data->instance_id = $payment_method['instance_id'];
+      $card_data->remote_id = $remote_id;
+      $card_data->card_type = !empty($card_type) ? $card_type : 'card';
+      $card_data->card_name = !empty($billing_address['name_line']) ? $billing_address['name_line'] : '';
+      $card_data->card_number = substr($pane_values['credit_card']['credit_card']['number'], -4);
+      $card_data->card_exp_month = $pane_values['credit_card']['credit_card']['exp_month'];
+      $card_data->card_exp_year = $pane_values['credit_card']['credit_card']['exp_year'];
+      $card_data->status = 1;
+      // Save and log the creation of the new card on file.
+      commerce_cardonfile_save( $card_data );
+      watchdog('commerce_cnp', 'ClickandPledge Payment Profile added to Customer Profile @profile_id for user @uid.', array('@profile_id' => $add_to_profile, '@uid' => $order->uid));
+    }
+  }
+}
+
+/**
+ * Card on file callback: updates the associated customer payment profile.
+ */
+function commerce_cnp_cardonfile_update($form, &$form_state, $payment_method, $card_data) {
+   return TRUE;
+}
+
+/**
+ * Card on file callback: deletes the associated customer payment profile.
+ */
+function commerce_cnp_cardonfile_delete($form, &$form_state, $payment_method, $card_data) {
+  return TRUE;
+}
+
+/**
+ * Function to return safe string to be used for XML processing by ClickandPledge
+ */
+function safe_string( $str ) {
+  return str_replace( '&', '&amp;', trim( $str ) );
+}
+
+/**
+ * Converts a price amount to a decimal value based on the currency.
+ */
+function safe_number( $str, $currency ) {
+  return commerce_currency_amount_to_decimal( $str, $currency ) * 100;
+}
+
+/**
+ * Rounds a number using the specified rounding mode.
+ */
+function safe_number_return( $str ) {
+  return commerce_round( COMMERCE_ROUND_HALF_DOWN , ( $str * 100 ) / 100 ); // COMMERCE_ROUND_NONE
+}
+
+/**
+ * If the given number is decimal we are taking decimal part only.
+ */
+function numberformat( $number ) {
+  $decimals = explode( '.', $number );
+  if ( count( $decimals ) == 0 ) {
+    return $number;
+  }
+  else {
+    return $decimals[0];
+  }
+}
+
+/**
+ * This will build the xml from the given order for processing by ClickandPledge.
+ * @param object $payment_method
+ * @param object $pane_form
+ * @param object $pane_values
+ * @param $order
+ * The order the transaction is on.
+ * @param array $charge
+ * The price array for the charge amount with keys of 'amount' and 'currency'.
+ * @param $vault_guid string
+ * Used for reference transaction when user used card on file functionality
+ * @param $order_number string
+ * Used for reference transaction when user used card on file functionality
+ * @return array with amount and XML string
+ */
+function commerce_cnp_buildxml($payment_method, $pane_form, $pane_values, $order, $charge, $vault_guid = '', $order_number = '') {
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+  // Build a description for the order.
+  $description = array();
+  // Building XML
+  $dom = new DOMDocument('1.0', 'UTF-8');
+  $root = $dom->createElement('CnPAPI', '');
+  $root->setAttribute("xmlns", "urn:APISchema.xsd");
+  $root = $dom->appendChild($root);
+
+  $version = $dom->createElement("Version", "1.5");
+  $version = $root->appendChild($version);
+
+  $engine = $dom->createElement('Engine', '');
+  $engine = $root->appendChild($engine);
+
+  $application = $dom->createElement('Application', '');
+  $application = $engine->appendChild($application);
+
+  $applicationid = $dom->createElement('ID', 'CnP_Drupal_Commerce');
+  $applicationid = $application->appendChild($applicationid);
+
+  $applicationname = $dom->createElement('Name', 'CnP_Drupal_Commerce');
+  $applicationid = $application->appendChild($applicationname);
+
+  $applicationversion = $dom->createElement('Version', '2.000.000.000.20130303');  // 2.000.000.000.20130103 Version-Minor change-Bug Fix-Internal Release Number -Release Date
+  $applicationversion = $application->appendChild($applicationversion);
+
+  $request = $dom->createElement('Request', '');
+  $request = $engine->appendChild($request);
+
+  $operation = $dom->createElement('Operation', '');
+  $operation = $request->appendChild( $operation );
+
+  $operationtype = $dom->createElement('OperationType', 'Transaction');
+  $operationtype = $operation->appendChild($operationtype);
+
+  $ipaddress = $dom->createElement('IPAddress', substr(ip_address(), 0, 15));
+  $ipaddress = $operation->appendChild($ipaddress);
+
+  $authentication = $dom->createElement('Authentication', '');
+  $authentication = $request->appendChild($authentication);
+
+  $accounttype = $dom->createElement('AccountGuid', $payment_method['settings']['account_guid'] );
+  $accounttype = $authentication->appendChild($accounttype);
+
+  $accountid = $dom->createElement('AccountID', $payment_method['settings']['account_id'] );
+  $accountid = $authentication->appendChild($accountid);
+
+  $cporder = $dom->createElement('Order', '');
+  $cporder = $request->appendChild($cporder);
+
+  $ordermode = $dom->createElement('OrderMode', ucfirst( $payment_method['settings']['order_mode'] ));
+  $ordermode = $cporder->appendChild($ordermode);
+
+  $cardholder = $dom->createElement('CardHolder', '');
+  $cardholder = $cporder->appendChild($cardholder);
+
+  $xmlpath = drupal_get_path('module', $payment_method['module']);
+  $separator = substr($xmlpath, -(strlen($payment_method['module'])+1), 1);
+  $countries = simplexml_load_file( $xmlpath . $separator . 'includes' . $separator . 'Countries.xml' );
+
+  // Prepare the billing address for use in the request.
+  if ($order_wrapper->commerce_customer_billing->value()) {
+    $billing_address = $order_wrapper->commerce_customer_billing->commerce_customer_address->value();
+
+    if (empty($billing_address['first_name'])) {
+      $name_parts = explode(' ', trim( $billing_address['name_line'] ));
+      $billing_address['first_name'] = array_shift($name_parts);
+      $billing_address['last_name'] = implode(' ', $name_parts);
+    }
+
+    $billinginfo = $dom->createElement('BillingInformation', '');
+    $billinginfo = $cardholder->appendChild($billinginfo);
+
+    $billfirst_name = $dom->createElement('BillingFirstName', safe_string( substr($billing_address['first_name'], 0, 50) ));
+    $billfirst_name = $billinginfo->appendChild($billfirst_name);
+
+    $billlast_name = $dom->createElement('BillingLastName', safe_string( substr($billing_address['last_name'], 0, 50) ));
+    $billlast_name = $billinginfo->appendChild($billlast_name);
+
+    $email = $order->mail;
+    if ( $email != '' ) {
+      $bill_email = $dom->createElement('BillingEmail', $email);
+      $bill_email = $billinginfo->appendChild($bill_email);
+    }
+
+    $billingaddress = $dom->createElement('BillingAddress', '');
+    $billingaddress = $cardholder->appendChild($billingaddress);
+
+    $billingaddress1 = $dom->createElement('BillingAddress1', safe_string( substr($billing_address['thoroughfare'], 0, 100) ));
+    $billingaddress1 = $billingaddress->appendChild($billingaddress1);
+
+    if ( isset( $billing_address['premise'] ) && $billing_address['premise'] != '' ) {
+      $billingaddress2 = $dom->createElement('BillingAddress2', safe_string( substr($billing_address['premise'], 0, 100) ));
+      $billingaddress2 = $billingaddress->appendChild($billingaddress2);
+    }
+
+    $billing_city = $dom->createElement('BillingCity', safe_string( substr($billing_address['locality'], 0, 50) ));
+    $billing_city = $billingaddress->appendChild($billing_city);
+
+    $billing_state = $dom->createElement('BillingStateProvince', substr($billing_address['administrative_area'], 0, 50));
+    $billing_state = $billingaddress->appendChild( $billing_state );
+
+    if ( $billing_address['postal_code'] != '' ) {
+      $billing_zip = $dom->createElement('BillingPostalCode', substr( $billing_address['postal_code'], 0, 20 ));
+      $billing_zip = $billingaddress->appendChild($billing_zip);
+    }
+
+    foreach ( $countries as $country ) {
+      if ( $country->attributes()->Abbrev == $billing_address['country'] ) {
+        $billing_country_id = $country->attributes()->Code;
+        break;
+      }
+      else {
+        $billing_country_id = '';
+      }
+    }
+    $billing_country = $dom->createElement('BillingCountryCode', str_pad($billing_country_id, 3, "0", STR_PAD_LEFT));
+    $billing_country = $billingaddress->appendChild($billing_country);
+  }
+  else {
+    $billinginfo = $dom->createElement('BillingInformation', '');
+    $billinginfo = $cardholder->appendChild($billinginfo);
+  }
+
+
+  // Prepare the Shipping address for use in the request.
+  if (module_exists('commerce_shipping') && $order_wrapper->commerce_customer_shipping->value()) {
+    $shippinginfo = $dom->createElement('ShippingInformation', '');
+    $shippinginfo = $cardholder->appendChild($shippinginfo);
+
+    $shippingcontact = $dom->createElement('ShippingContactInformation', '');
+    $shippingcontact = $shippinginfo->appendChild($shippingcontact);
+    $shipping_address = $order_wrapper->commerce_customer_shipping->commerce_customer_address->value();
+
+    if (empty($shipping_address['first_name'])) {
+      $name_parts = explode(' ', trim( $shipping_address['name_line'] ));
+      $shipping_address['first_name'] = array_shift($name_parts);
+      $shipping_address['last_name'] = implode(' ', $name_parts);
+    }
+
+    $shippingfirst_name = $dom->createElement('ShippingFirstName', safe_string( substr($shipping_address['first_name'], 0, 50) ));
+    $shippingfirst_name = $shippingcontact->appendChild($shippingfirst_name);
+
+    $shippinglast_name = $dom->createElement('ShippingLastName', safe_string( substr($shipping_address['last_name'], 0, 50) ));
+    $shippinglast_name = $shippingcontact->appendChild($shippinglast_name);
+
+    $shippingaddress = $dom->createElement('ShippingAddress', '');
+    $shippingaddress = $shippinginfo->appendChild($shippingaddress);
+
+    $shippingaddress1 = $dom->createElement('ShippingAddress1', safe_string( substr($shipping_address['thoroughfare'], 0, 100) ));
+    $shippingaddress1 = $shippingaddress->appendChild($shippingaddress1);
+
+    if ( isset( $shipping_address['premise'] ) && $shipping_address['premise'] != '' ) {
+        $shippingaddress2 = $dom->createElement('ShippingAddress2', safe_string( substr($shipping_address['premise'], 0, 100) ));
+        $shippingaddress2 = $shippingaddress->appendChild($shippingaddress2);
+    }
+
+    $shipping_city = $dom->createElement('ShippingCity', safe_string( substr($shipping_address['locality'], 0, 50) ));
+    $shipping_city = $shippingaddress->appendChild($shipping_city);
+
+    $shipping_state = $dom->createElement('ShippingStateProvince', substr($shipping_address['administrative_area'], 0, 50));
+    $shipping_state = $shippingaddress->appendChild($shipping_state);
+
+    if ( $shipping_address['postal_code'] != '' ) {
+      $shipping_zip = $dom->createElement('ShippingPostalCode', substr($shipping_address['postal_code'], 0, 20));
+      $shipping_zip = $shippingaddress->appendChild($shipping_zip);
+    }
+    foreach ( $countries as $country ) {
+      if ( $country->attributes()->Abbrev == $shipping_address['country'] ) {
+        $shipping_country_id = $country->attributes()->Code;
+        break;
+      }
+      else{
+        $shipping_country_id = '';
+      }
+    }
+    $shipping_country = $dom->createElement('ShippingCountryCode', str_pad($shipping_country_id, 3, "0", STR_PAD_LEFT));
+    $shipping_country = $shippingaddress->appendChild($shipping_country);
+  }
+
+  $paymentmethod = $dom->createElement('PaymentMethod', '');
+  $paymentmethod = $cardholder->appendChild($paymentmethod);
+
+  if ( $vault_guid == '' ) {
+    $payment_type = $dom->createElement('PaymentType', 'CreditCard');
+    $payment_type = $paymentmethod->appendChild($payment_type);
+
+    $creditcard = $dom->createElement('CreditCard', '');
+    $creditcard = $paymentmethod->appendChild($creditcard);
+
+    if ( $pane_values['credit_card']['credit_card']['owner'] != '' ) {
+      $credit_name = $dom->createElement('NameOnCard', substr( $pane_values['credit_card']['credit_card']['owner'], 0, 50));
+      $credit_name = $creditcard->appendChild($credit_name);
+    }
+    else {
+      $nameoncard = !empty($billing_address['name_line']) ? $billing_address['name_line'] : '';
+      if ( $nameoncard != '' ) {
+        $credit_name = $dom->createElement('NameOnCard', substr( $nameoncard, 0, 50));
+        $credit_name = $creditcard->appendChild($credit_name);
+      }
+    }
+
+    $credit_number = $dom->createElement('CardNumber', $pane_values['credit_card']['credit_card']['number']);
+    $credit_number = $creditcard->appendChild($credit_number);
+
+    $credit_cvv = $dom->createElement('Cvv2', $pane_values['credit_card']['credit_card']['code']);
+    $credit_cvv = $creditcard->appendChild($credit_cvv);
+
+    $credit_expdate = $dom->createElement('ExpirationDate', str_pad($pane_values['credit_card']['credit_card']['exp_month'], 2, '0', STR_PAD_LEFT) . '/' . substr($pane_values['credit_card']['credit_card']['exp_year'], 2, 2));
+    $credit_expdate = $creditcard->appendChild($credit_expdate);
+  }
+  else {
+    $payment_type = $dom->createElement('PaymentType', 'ReferenceTransaction');
+    $payment_type = $paymentmethod->appendChild($payment_type);
+
+    $reference_transaction = $dom->createElement('ReferenceTransaction', '');
+    $reference_transaction = $paymentmethod->appendChild($reference_transaction);
+
+    $order_number_node = $dom->createElement('OrderNumber', $order_number);
+    $order_number_node = $reference_transaction->appendChild($order_number_node);
+
+    $vault_guid_node = $dom->createElement('VaultGUID', $vault_guid);
+    $vault_guid_node = $reference_transaction->appendChild($vault_guid_node);
+  }
+
+  $itemcount = $shipping_count = $discount_count = $shipp_value = $base_price = $tax_value = $tax_calculate = $tax_calculate = $amount_calculate = $shippvalue_calculate = $shipptax_calculate = $discount_calculate = $transaction_discount_calculate = $coupon_discount = 0;
+  $coupon_code_array = array();
+
+  $orderitemlist = $dom->createElement('OrderItemList', '');
+  $orderitemlist = $cporder->appendChild($orderitemlist);
+
+  foreach ($order_wrapper->commerce_line_items as $delta => $line_item_wrapper) {
+    if (in_array($line_item_wrapper->type->value(), commerce_product_line_item_types())) {
+      $product_details = $line_item_wrapper->commerce_product->value();
+      $line_item_details = commerce_line_item_load($line_item_wrapper->line_item_id->value());
+      $fields = $line_item_wrapper->getPropertyInfo();
+
+      $sell_price_price_details = commerce_product_calculate_sell_price( $product_details );
+
+      $orderitem = $dom->createElement('OrderItem', '');
+      $orderitem = $orderitemlist->appendChild($orderitem);
+
+      $itemid = $dom->createElement('ItemID', ++$itemcount);
+      $itemid = $orderitem->appendChild($itemid);
+
+      if ( $product_details->title != '' ) {
+        $itemname = $dom->createElement('ItemName', substr( $product_details->title, 0, 50));
+        $itemname = $orderitem->appendChild($itemname);
+      }
+      elseif ( isset( $product_details->sku  ) && $product_details->sku != '' ) {
+        $itemname = $dom->createElement('ItemName', substr( $product_details->sku, 0, 50));
+        $itemname = $orderitem->appendChild($itemname);
+      }
+
+      $quntity = $dom->createElement('Quantity', round($line_item_wrapper->quantity->value(), 0));
+      $quntity = $orderitem->appendChild($quntity);
+
+      $itemdescount = $k = $itemtax = $itemprice = 0;
+
+      foreach ( $product_details->commerce_price as $base_price_details ) {
+        if ( count( $base_price_details[0]['data']['components'] ) > 0 ) {
+          // This is the case where the product price includes Tax. if any
+          foreach ( $base_price_details[0]['data']['components'] as $component ) {
+            if ( $component['name'] == 'base_price' ) {
+              /*
+              Check whether recurring variable is set or not
+              */
+              $recurring_check = ( isset( $payment_method['settings']['is_recurring'] ) );
+
+              /*
+              Check whether admin enables recurring or not
+              */
+              $recurring_enable_check = ( $payment_method['settings']['is_recurring'] == 0 );
+
+              /*
+              Check whether option selected by user is not 'I want to make a recurring payment'
+              */
+              $other_check = ( isset( $pane_values['other'] ) && $pane_values['other']['is_recurring'] != 'recurring' );
+
+              /*
+              Check whether option selected by user 'I want to make a recurring payment' and Recurring Method is Subscription.
+              */
+              $other_recurring_check = ( isset( $pane_values['other'] ) && $pane_values['other']['is_recurring'] == 'recurring' && $pane_values['other']['recurring_method'] == 'Subscription');
+              if ( $recurring_check && $other_check || !$recurring_check || $recurring_enable_check || ( $recurring_check && $other_recurring_check )  ) {
+                $amount_calculate += ($component['price']['amount'] * round($line_item_wrapper->quantity->value(), 0));
+              }
+              $itemprice = $component['price']['amount'];
+            }
+          }
+        }
+        else {
+          /*
+          Check whether recurring variable is set or not
+          */
+          $recurring_check = ( isset( $payment_method['settings']['is_recurring'] ) );
+
+          /*
+          Check whether admin enables recurring or not
+          */
+          $recurring_enable_check = ( $payment_method['settings']['is_recurring'] == 0 );
+
+          /*
+          Check whether option selected by user is not 'I want to make a recurring payment'
+          */
+          $other_check = ( isset( $pane_values['other'] ) && $pane_values['other']['is_recurring'] != 'recurring' );
+
+          /*
+          Check whether option selected by user 'I want to make a recurring payment' and Recurring Method is Subscription.
+          */
+          $other_recurring_check = ( isset( $payment_method['settings']['is_recurring'] ) ) && ( isset( $pane_values['other'] ) && $pane_values['other']['is_recurring'] == 'recurring' && $pane_values['other']['recurring_method'] == 'Subscription');
+
+          if ( ( $recurring_check && $other_check ) || !$recurring_check || $recurring_enable_check || ( $other_recurring_check ) ) {
+            $amount_calculate += ($base_price_details[0]['amount'] * round($line_item_wrapper->quantity->value(), 0));
+          }
+          $itemprice = $base_price_details[0]['amount'];
+        }
+      }
+
+      foreach ( $sell_price_price_details['data'] as $price_details ) {
+        if ( count( $price_details ) > 0 ) {
+          foreach ( $price_details as $details ) {
+            if ( substr($details['name'], 0, 3) == 'tax' ) {
+              $itemtax += safe_number_return( $details['price']['amount'] );
+
+              /*
+              Check whether recurring variable is set or not
+              */
+              $recurring_check = ( isset( $payment_method['settings']['is_recurring'] ) );
+
+              /*
+              Check whether admin enables recurring or not
+              */
+              $recurring_enable_check = ( $payment_method['settings']['is_recurring'] == 0 );
+
+              /*
+              Check whether option selected by user is not 'I want to make a recurring payment'
+              */
+              $other_check = ( isset( $pane_values['other'] ) && $pane_values['other']['is_recurring'] != 'recurring' );
+
+              /*
+              Check whether option selected by user 'I want to make a recurring payment' and Recurring Method is Subscription.
+              */
+              $other_recurring_check = ( isset( $payment_method['settings']['is_recurring'] ) ) && ( isset( $pane_values['other'] ) && $pane_values['other']['is_recurring'] == 'recurring' && $pane_values['other']['recurring_method'] == 'Subscription');
+
+              if ( ( $recurring_check )  && ( $other_check ) || !$recurring_check || $recurring_enable_check || ( ( $recurring_check ) && $other_recurring_check ) ) {
+                $tax_calculate += (safe_number_return( $details['price']['amount'] )*round($line_item_wrapper->quantity->value(), 0));
+              }
+            }
+
+            if ( substr($details['name'], 0, 8) == 'discount' ) {
+              $itemdescount += safe_number_return( $details['price']['amount'] );
+
+              /*
+              Check whether recurring variable is set or not
+              */
+              $recurring_check = ( isset( $payment_method['settings']['is_recurring'] ) );
+
+              /*
+              Check whether admin enables recurring or not
+              */
+              $recurring_enable_check = ( $payment_method['settings']['is_recurring'] == 0 );
+
+              /*
+              Check whether option selected by user is not 'I want to make a recurring payment'
+              */
+              $other_check = ( isset( $pane_values['other'] ) && $pane_values['other']['is_recurring'] != 'recurring' );
+
+              /*
+              Check whether option selected by user 'I want to make a recurring payment' and Recurring Method is Subscription.
+              */
+              $other_recurring_check = ( isset( $payment_method['settings']['is_recurring'] ) ) && ( isset( $pane_values['other'] ) && $pane_values['other']['is_recurring'] == 'recurring' && $pane_values['other']['recurring_method'] == 'Subscription');
+
+              if ( ( $recurring_check )  && ( $other_check ) || !$recurring_check || $recurring_enable_check || ( ( $recurring_check ) && $other_recurring_check ) ) {
+                $discount_calculate +=  safe_number_return( $details['price']['amount'] ) * round($line_item_wrapper->quantity->value(), 0);
+              }
+            }
+            $k++;
+          }
+        }
+      }
+
+      /*
+      Check whether recurring variable is set or not
+      */
+      $recurring_check = ( isset( $payment_method['settings']['is_recurring'] ) );
+
+      /*
+      Check whether admin enables recurring or not
+      */
+      $recurring_enable_check = ( $payment_method['settings']['is_recurring'] == 0 );
+
+      /*
+      Check whether option selected by user is not 'I want to make a recurring payment'
+      */
+      $other_check = ( isset( $pane_values['other'] ) && $pane_values['other']['is_recurring'] == 'recurring' );
+
+      if ( ( $recurring_check ) && ( $other_check ) ) {
+        if ( $pane_values['other']['recurring_method'] == 'Installment' ) {
+          $itemprice =  numberformat( $itemprice/$pane_values['other']['installments'] );
+          $itemtax = numberformat( $itemtax/$pane_values['other']['installments'] );
+          $itemdescount = numberformat( $itemdescount/$pane_values['other']['installments'] );
+
+          $amount_calculate += $itemprice * round($line_item_wrapper->quantity->value(), 0);
+          $tax_calculate += $itemtax * round( $line_item_wrapper->quantity->value(), 0 );
+          $discount_calculate += $itemdescount * round( $line_item_wrapper->quantity->value(), 0 );
+        }
+        else {
+          $tax_calculate = $tax_calculate;
+          $discount_calculate = $discount_calculate;
+        }
+      }
+      else {
+        $tax_calculate = $tax_calculate;
+        $discount_calculate = $discount_calculate;
+      }
+
+      $unitprice = $dom->createElement('UnitPrice', safe_number( $itemprice, $charge['currency_code'] ) );
+      $unitprice = $orderitem->appendChild($unitprice);
+
+      $unit_deduct = $dom->createElement('UnitDeductible', '000');
+      $unit_deduct = $orderitem->appendChild($unit_deduct);
+
+      $unit_tax = $dom->createElement('UnitTax', safe_number( $itemtax, $charge['currency_code'] ));
+      $unit_tax = $orderitem->appendChild($unit_tax);
+
+      $unit_disc = $dom->createElement('UnitDiscount', abs( safe_number( $itemdescount, $charge['currency_code'] ) ));
+      $unit_disc = $orderitem->appendChild($unit_disc);
+
+      if ( isset( $product_details->sku  ) ) {
+        $sku_code = $dom->createElement('SKU', substr($product_details->sku, 0, 25));
+        $sku_code = $orderitem->appendChild($sku_code);
+      }
+    }
+
+    // Shipping
+    if (in_array($line_item_wrapper->type->value(), array( 'shipping' ))) {
+      // To handle If more than one shipping method if exists or if there is any possibility to choose more than one!!
+      if ( $shipping_count == 0 ) {
+        $shipping = $dom->createElement('Shipping', '');
+        $shipping = $cporder->appendChild($shipping);
+      }
+      $shippingmethod_details = commerce_shipping_service_load( $line_item_wrapper->commerce_shipping_service->value() );
+
+      $shipping_method = $dom->createElement('ShippingMethod', substr( $shippingmethod_details['display_title'], 0, 50));
+      $shipping_method = $shipping->appendChild($shipping_method);
+
+      if ( isset( $shippingmethod_details['base_rate'] ) && count( $shippingmethod_details['base_rate']['data'] ) > 0  ) { // To handle Tax include in the shipping value
+        foreach ( $shippingmethod_details['base_rate']['data']['components'] as $shipp ) {
+          if ( substr($shipp['name'], 0, 3) == 'tax' ) {
+            $shipptax_calculate +=  $shipp['price']['amount'];
+          }
+          else {
+            $shippvalue_calculate += $shipp['price']['amount'];
+          }
+        }
+
+        /*
+        Check whether recurring variable is set or not
+        */
+        $recurring_check = ( isset( $payment_method['settings']['is_recurring'] ) );
+
+        /*
+        Check whether admin enables recurring or not
+        */
+        $recurring_enable_check = ( $payment_method['settings']['is_recurring'] == 0 );
+
+        /*
+        Check whether option selected by user is not 'I want to make a recurring payment'
+        */
+        $other_check = ( isset( $pane_values['other'] ) && $pane_values['other']['is_recurring'] == 'recurring' );
+
+        if ( ( $recurring_check ) && ( $other_check ) ) {
+          if ( $pane_values['other']['recurring_method'] == 'Installment' ) {
+            $shippvalue_calculate = numberformat(  $shippvalue_calculate /$pane_values['other']['installments'] );
+            $shipptax_calculate = numberformat(  $shipptax_calculate /$pane_values['other']['installments'] );
+          }
+        }
+
+        $shipping_value = $dom->createElement('ShippingValue', safe_number( $shippvalue_calculate, $charge['currency_code'] ));
+        $shipping_value = $shipping->appendChild($shipping_value);
+
+        $shipping_tax = $dom->createElement('ShippingTax', safe_number( $shipptax_calculate, $charge['currency_code'] ));
+        $shipping_tax = $shipping->appendChild($shipping_tax);
+      }
+      else {
+        $shipping_price_details = $line_item_wrapper->commerce_unit_price->value();
+        if ( count( $shipping_price_details['amount'] ) > 0  ) {
+          foreach ( $shipping_price_details['data']['components'] as $shipp ) {
+            if ( substr($shipp['name'], 0, 3) == 'tax' ) {
+              $shipptax_calculate += $shipp['price']['amount'];
+            }
+            else {
+              $shippvalue_calculate += $shipp['price']['amount'];
+            }
+          }
+
+          /*
+          Check whether recurring variable is set or not
+          */
+          $recurring_check = ( isset( $payment_method['settings']['is_recurring'] ) && ( $payment_method['settings']['is_recurring'] == 1 ) );
+
+          /*
+          Check whether option selected by user is not 'I want to make a recurring payment'
+          */
+          $other_check = ( isset( $pane_values['other'] ) && $pane_values['other']['is_recurring'] == 'recurring' );
+
+          if ( ( $recurring_check ) && ( $other_check ) ) {
+            if ( $pane_values['other']['recurring_method'] == 'Installment' ) {
+              $shippvalue_calculate = numberformat(  $shippvalue_calculate /$pane_values['other']['installments'] );
+              $shipptax_calculate = numberformat( $shipptax_calculate /$pane_values['other']['installments'] );
+            }
+          }
+          $shipping_value = $dom->createElement('ShippingValue', safe_number( $shippvalue_calculate, $charge['currency_code'] ));
+          $shipping_value = $shipping->appendChild($shipping_value);
+
+          $shipping_tax = $dom->createElement('ShippingTax', safe_number( $shipptax_calculate, $charge['currency_code'] ));
+          $shipping_tax = $shipping->appendChild($shipping_tax);
+        }
+      }
+      $shipping_count++;
+    }
+    $description[] = round($line_item_wrapper->quantity->value(), 2) . 'x ' . $line_item_wrapper->line_item_label->value();
+  }
+
+  if ( module_exists('commerce_coupon') && count( $order_wrapper->commerce_coupon_order_reference->value() ) > 0 ) {
+    foreach ( $order_wrapper->commerce_coupon_order_reference->value() as $applied_coupon ) {
+      foreach ( $applied_coupon->commerce_coupon_code as $code ) {
+        array_push( $coupon_code_array, $code[0]['value'] );
+      }
+    }
+  }
+
+  $subtotals = $order_wrapper->commerce_order_total->value();
+
+  for ( $i = 0; $i < count( $subtotals['data']['components'] ); $i++ ) {
+    if ( $subtotals['data']['components'][$i]['name'] == 'flat_rate_express_shipping' ) {
+      $shipp_value += $subtotals['data']['components'][$i]['price']['amount'];
+    }
+
+    if ( substr($subtotals['data']['components'][$i]['name'], 0, 3) == 'tax' ) {
+      $tax_value += $subtotals['data']['components'][$i]['price']['amount'];
+    }
+
+    if ( $subtotals['data']['components'][$i]['name'] == 'discount' ) {
+      /*
+      Check whether recurring variable is set or not
+      */
+      $recurring_check = ( isset( $payment_method['settings']['is_recurring'] ) && ( $payment_method['settings']['is_recurring'] == 1 ) );
+
+      /*
+      Check whether option selected by user is not 'I want to make a recurring payment'
+      */
+      $other_check = ( isset( $pane_values['other'] ) && $pane_values['other']['is_recurring'] == 'recurring' );
+
+      if ( ( $recurring_check ) && ( $other_check ) ) {
+        if ( $pane_values['other']['recurring_method'] == 'Installment' ) {
+          $td = numberformat(  $subtotals['data']['components'][$i]['price']['amount'] /$pane_values['other']['installments'] );
+        }
+        else {
+          $td = $subtotals['data']['components'][$i]['price']['amount'];
+        }
+      }
+      else {
+        $td = $subtotals['data']['components'][$i]['price']['amount'];
+      }
+
+      $transaction_discount_calculate = safe_number_return( abs( $td ) ) - abs( $discount_calculate );
+    }
+
+    if (  substr( $subtotals['data']['components'][$i]['name'], 0, 15) == 'commerce_coupon' ) {
+      $coupon_discount += abs( $subtotals['data']['components'][$i]['price']['amount'] );
+    }
+
+    if ( $subtotals['data']['components'][$i]['name'] == 'base_price' )
+      $base_price = $subtotals['data']['components'][$i]['price']['amount'];
+    }
+
+    /*
+    Check whether recurring variable is set or not
+    */
+    $recurring_check = ( isset( $payment_method['settings']['is_recurring'] ) && ( $payment_method['settings']['is_recurring'] == 1 ) );
+
+    /*
+    Check whether option selected by user is not 'I want to make a recurring payment'
+    */
+    $other_check = ( isset( $pane_values['other'] ) && $pane_values['other']['is_recurring'] == 'recurring' );
+
+    if ( ( $recurring_check ) && ( $other_check ) ) {
+      if ( $pane_values['other']['recurring_method'] == 'Installment' ) {
+        $coupon_discount = numberformat(  $coupon_discount /$pane_values['other']['installments'] );
+      }
+    }
+    $receipt = $dom->createElement('Receipt', '');
+    $receipt = $cporder->appendChild($receipt);
+
+    $recipt_lang = $dom->createElement('Language', 'ENG');
+    $recipt_lang = $receipt->appendChild($recipt_lang);
+
+    if ( $payment_method['settings']['organization_information'] != '' ) {
+      $recipt_org = $dom->createElement('OrganizationInformation', safe_string( $payment_method['settings']['organization_information'] ) );
+      $recipt_org = $receipt->appendChild($recipt_org);
+    }
+
+    if ( $payment_method['settings']['thankyou_message'] != '' ) {
+      $recipt_thanks = $dom->createElement('ThankYouMessage', safe_string( $payment_method['settings']['thankyou_message'] ) );
+      $recipt_thanks = $receipt->appendChild($recipt_thanks);
+    }
+
+    if ( $payment_method['settings']['terms_condition'] != '' ) {
+      $recipt_terms = $dom->createElement('TermsCondition',  safe_string( $payment_method['settings']['terms_condition'] ) );
+      $recipt_terms = $receipt->appendChild($recipt_terms);
+    }
+
+    if ( $payment_method['settings']['email_customer'] ) {
+      $recipt_email = $dom->createElement('EmailNotificationList', '');
+      $recipt_email = $receipt->appendChild($recipt_email);
+
+      $email_note = $dom->createElement('NotificationEmail', $email);
+      $email_note = $recipt_email->appendChild($email_note);
+    }
+
+    $transation = $dom->createElement('Transaction', '');
+    $transation = $cporder->appendChild($transation);
+
+    $trans_type = $dom->createElement('TransactionType', 'Payment');
+    $trans_type = $transation->appendChild($trans_type);
+
+    $trans_desc = $dom->createElement('DynamicDescriptor', 'DynamicDescriptor');
+    $trans_desc = $transation->appendChild($trans_desc);
+
+    /*
+    Check whether recurring variable is set or not
+    */
+    $recurring_check = ( isset( $payment_method['settings']['is_recurring'] ) && ( $payment_method['settings']['is_recurring'] == 1 ) );
+
+    /*
+    Check whether option selected by user is not 'I want to make a recurring payment'
+    */
+    $other_check = ( isset( $pane_values['other'] ) && $pane_values['other']['is_recurring'] == 'recurring' );
+
+    if ( ( $recurring_check ) && ( $other_check ) ) {
+      $trans_recurr = $dom->createElement('Recurring', '');
+      $trans_recurr = $transation->appendChild($trans_recurr);
+
+      if ( $pane_values['other']['installments'] != '' ) {
+        $total_installment = $dom->createElement('Installment', $pane_values['other']['installments']);
+        $total_installment = $trans_recurr->appendChild($total_installment);
+      }
+      else {
+        $total_installment = $dom->createElement('Installment', '999');
+        $total_installment = $trans_recurr->appendChild($total_installment);
+      }
+
+      $total_periodicity = $dom->createElement('Periodicity', $pane_values['other']['periodicity']);
+      $total_periodicity = $trans_recurr->appendChild($total_periodicity);
+
+      $recurring_method = $dom->createElement('RecurringMethod', $pane_values['other']['recurring_method']);
+      $recurring_method = $trans_recurr->appendChild($recurring_method);
+    }
+
+    $trans_totals = $dom->createElement('CurrentTotals', '');
+    $trans_totals = $transation->appendChild($trans_totals);
+    $discount_todeduct = abs( $discount_calculate ) + $transaction_discount_calculate + $coupon_discount;
+
+    $discount_todeduct = safe_number_return( $discount_todeduct );
+
+    $total_discount = $dom->createElement('TotalDiscount', ( abs( $discount_todeduct ) ));
+    $total_discount = $trans_totals->appendChild($total_discount);
+
+    $total_tax = $dom->createElement('TotalTax', safe_number_return($tax_calculate+$shipptax_calculate));
+    $total_tax = $trans_totals->appendChild($total_tax);
+
+    $total_ship = $dom->createElement('TotalShipping', $shippvalue_calculate);
+    $total_ship = $trans_totals->appendChild($total_ship);
+
+    $totalcharged = ($amount_calculate+$tax_calculate+$shipptax_calculate+$shippvalue_calculate)-(abs(safe_number( safe_number_return( $discount_todeduct ), $charge['currency_code'] )));
+
+    $total_amount = $dom->createElement( 'Total',  $totalcharged );
+    $total_amount = $trans_totals->appendChild($total_amount);
+
+    $coupons_str = '';
+    for ( $c = 0; $c < count( $coupon_code_array ); $c++ ) {
+      $coupons_str .= $coupon_code_array[$c] . ',';
+    }
+
+    if ( count( $coupon_code_array ) > 0 && $coupons_str != '') {
+      $trans_coupon = $dom->createElement('CouponCode', substr($coupons_str, 0, -1));
+      $trans_coupon = $transation->appendChild($trans_coupon);
+    }
+
+    $trans_discount = abs(safe_number( $transaction_discount_calculate, $charge['currency_code'] )) + $coupon_discount;
+    $trans_discount = safe_number_return( $trans_discount );
+    if ( $trans_discount != 0 ) {
+      $trans_coupon_discount = $dom->createElement('TransactionDiscount', $trans_discount);
+      $trans_coupon_discount = $transation->appendChild($trans_coupon_discount);
+    }
+
+    $strparam['xml'] = $dom->saveXML();
+    $strparam['totalcharged'] = $totalcharged;
+    // echo $dom->saveXML();
+    // die();
+    return $strparam;
+}
+
+/*
+ * Call back function to handle payment made by admin
+ * @param object $payment_method
+ * @param object $pane_form
+ * @param object $pane_values
+ * @param $order
+ * The order the transaction is on.
+ * @param array $charge
+ * The price array for the charge amount with keys of 'amount' and 'currency'.
+ * @param $vault_guid string
+ * Used for reference transaction when user used card on file functionality
+ * @param $order_number string
+ * Used for reference transaction when user used card on file functionality
+ * @return array with amount and XML string
+ */
+function commerce_cnp_buildxml_admin($payment_method, $pane_form, $pane_values, $order, $charge, $vault_guid = '', $order_number = '') {
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+  // Build a description for the order.
+  $description = array();
+
+  // Building XML
+  $dom = new DOMDocument('1.0', 'UTF-8');
+  $root = $dom->createElement('CnPAPI', '');
+  $root->setAttribute("xmlns", "urn:APISchema.xsd");
+  $root = $dom->appendChild($root);
+
+  $version = $dom->createElement("Version", "1.5");
+  $version = $root->appendChild($version);
+
+  $engine = $dom->createElement('Engine', '');
+  $engine = $root->appendChild($engine);
+
+  $application = $dom->createElement('Application', '');
+  $application = $engine->appendChild($application);
+
+  $applicationid = $dom->createElement('ID', 'CnP_Drupal_Commerce');
+  $applicationid = $application->appendChild($applicationid);
+
+  $applicationname = $dom->createElement('Name', 'CnP_Drupal_Commerce');
+  $applicationid = $application->appendChild($applicationname);
+
+  $applicationversion = $dom->createElement('Version', '2.000.000.000.20130303');  // 2.000.000.000.20130103 Version-Minor change-Bug Fix-Internal Release Number -Release Date
+  $applicationversion = $application->appendChild($applicationversion);
+
+  $request = $dom->createElement('Request', '');
+  $request = $engine->appendChild($request);
+
+  $operation = $dom->createElement('Operation', '');
+  $operation = $request->appendChild( $operation );
+
+  $operationtype = $dom->createElement('OperationType', 'Transaction');
+  $operationtype = $operation->appendChild($operationtype);
+
+  $ipaddress = $dom->createElement('IPAddress', substr(ip_address(), 0, 15));
+  $ipaddress = $operation->appendChild($ipaddress);
+
+  $authentication = $dom->createElement('Authentication', '');
+  $authentication = $request->appendChild($authentication);
+
+  $accounttype = $dom->createElement('AccountGuid', $payment_method['settings']['account_guid'] );
+  $accounttype = $authentication->appendChild($accounttype);
+
+  $accountid = $dom->createElement('AccountID', $payment_method['settings']['account_id'] );
+  $accountid = $authentication->appendChild($accountid);
+
+  $cporder = $dom->createElement('Order', '');
+  $cporder = $request->appendChild($cporder);
+
+  $ordermode = $dom->createElement('OrderMode', ucfirst( $payment_method['settings']['order_mode'] ));
+  $ordermode = $cporder->appendChild($ordermode);
+
+  $cardholder = $dom->createElement('CardHolder', '');
+  $cardholder = $cporder->appendChild($cardholder);
+
+  $xmlpath = drupal_get_path('module', $payment_method['module']);
+  $separator = substr($xmlpath, -(strlen($payment_method['module'])+1), 1);
+  $countries = simplexml_load_file( $xmlpath . $separator . 'includes' . $separator . 'Countries.xml' );
+
+  // Prepare the billing address for use in the request.
+  if ($order_wrapper->commerce_customer_billing->value()) {
+    $billing_address = $order_wrapper->commerce_customer_billing->commerce_customer_address->value();
+    if (empty($billing_address['first_name'])) {
+      $name_parts = explode(' ', trim( $billing_address['name_line'] ));
+      $billing_address['first_name'] = array_shift($name_parts);
+      $billing_address['last_name'] = implode(' ', $name_parts);
+    }
+
+    $billinginfo = $dom->createElement('BillingInformation', '');
+    $billinginfo = $cardholder->appendChild($billinginfo);
+
+    $billfirst_name = $dom->createElement('BillingFirstName', safe_string( substr($billing_address['first_name'], 0, 50) ));
+    $billfirst_name = $billinginfo->appendChild($billfirst_name);
+
+    $billlast_name = $dom->createElement('BillingLastName', safe_string( substr($billing_address['last_name'], 0, 50) ));
+    $billlast_name = $billinginfo->appendChild($billlast_name);
+
+    $email = $order->mail;
+    if ( $email != '' ) {
+      $bill_email = $dom->createElement('BillingEmail', $email);
+      $bill_email = $billinginfo->appendChild($bill_email);
+    }
+
+    $billingaddress = $dom->createElement('BillingAddress', '');
+    $billingaddress = $cardholder->appendChild($billingaddress);
+
+    $billingaddress1 = $dom->createElement('BillingAddress1', safe_string( substr($billing_address['thoroughfare'], 0, 100) ));
+    $billingaddress1 = $billingaddress->appendChild($billingaddress1);
+
+    if ( isset( $billing_address['premise'] ) && $billing_address['premise'] != '' ) {
+      $billingaddress2 = $dom->createElement('BillingAddress2', safe_string( substr($billing_address['premise'], 0, 100) ));
+      $billingaddress2 = $billingaddress->appendChild($billingaddress2);
+    }
+
+    $billing_city = $dom->createElement('BillingCity', safe_string( substr($billing_address['locality'], 0, 50) ));
+    $billing_city = $billingaddress->appendChild($billing_city);
+
+    $billing_state = $dom->createElement('BillingStateProvince', substr($billing_address['administrative_area'], 0, 50));
+    $billing_state = $billingaddress->appendChild( $billing_state );
+
+    if ( $billing_address['postal_code'] != '' ) {
+      $billing_zip = $dom->createElement('BillingPostalCode', substr( $billing_address['postal_code'], 0, 20 ));
+      $billing_zip = $billingaddress->appendChild($billing_zip);
+    }
+
+    foreach ( $countries as $country ) {
+      if ( $country->attributes()->Abbrev == $billing_address['country'] ) {
+        $billing_country_id = $country->attributes()->Code;
+        break;
+      }
+      else {
+        $billing_country_id = '';
+      }
+    }
+    $billing_country = $dom->createElement('BillingCountryCode', str_pad($billing_country_id, 3, "0", STR_PAD_LEFT));
+    $billing_country = $billingaddress->appendChild($billing_country);
+  }
+  else {
+    $billinginfo = $dom->createElement('BillingInformation', '');
+    $billinginfo = $cardholder->appendChild($billinginfo);
+  }
+
+
+  // Prepare the Shipping address for use in the request.
+  if (module_exists('commerce_shipping') && $order_wrapper->commerce_customer_shipping->value()) {
+
+    $shippinginfo = $dom->createElement('ShippingInformation', '');
+    $shippinginfo = $cardholder->appendChild($shippinginfo);
+
+    $shippingcontact = $dom->createElement('ShippingContactInformation', '');
+    $shippingcontact = $shippinginfo->appendChild($shippingcontact);
+    $shipping_address = $order_wrapper->commerce_customer_shipping->commerce_customer_address->value();
+
+    if (empty($shipping_address['first_name'])) {
+      $name_parts = explode(' ', trim( $shipping_address['name_line'] ));
+      $shipping_address['first_name'] = array_shift($name_parts);
+      $shipping_address['last_name'] = implode(' ', $name_parts);
+    }
+
+    $shippingfirst_name = $dom->createElement('ShippingFirstName', safe_string( substr($shipping_address['first_name'], 0, 50) ));
+    $shippingfirst_name = $shippingcontact->appendChild($shippingfirst_name);
+
+    $shippinglast_name = $dom->createElement('ShippingLastName', safe_string( substr($shipping_address['last_name'], 0, 50) ));
+    $shippinglast_name = $shippingcontact->appendChild($shippinglast_name);
+
+    $shippingaddress = $dom->createElement('ShippingAddress', '');
+    $shippingaddress = $shippinginfo->appendChild($shippingaddress);
+
+    $shippingaddress1 = $dom->createElement('ShippingAddress1', safe_string( substr($shipping_address['thoroughfare'], 0, 100) ));
+    $shippingaddress1 = $shippingaddress->appendChild($shippingaddress1);
+
+    if ( isset( $shipping_address['premise'] ) && $shipping_address['premise'] != '' ) {
+        $shippingaddress2 = $dom->createElement('ShippingAddress2', safe_string( substr($shipping_address['premise'], 0, 100) ));
+        $shippingaddress2 = $shippingaddress->appendChild($shippingaddress2);
+    }
+
+    $shipping_city = $dom->createElement('ShippingCity', safe_string( substr($shipping_address['locality'], 0, 50) ));
+    $shipping_city = $shippingaddress->appendChild($shipping_city);
+
+    $shipping_state = $dom->createElement('ShippingStateProvince', substr($shipping_address['administrative_area'], 0, 50));
+    $shipping_state = $shippingaddress->appendChild($shipping_state);
+
+    if ( $shipping_address['postal_code'] != '' ) {
+      $shipping_zip = $dom->createElement('ShippingPostalCode', substr($shipping_address['postal_code'], 0, 20));
+      $shipping_zip = $shippingaddress->appendChild($shipping_zip);
+    }
+    foreach ( $countries as $country ) {
+      if ( $country->attributes()->Abbrev == $shipping_address['country'] ) {
+        $shipping_country_id = $country->attributes()->Code;
+        break;
+      }
+      else{
+        $shipping_country_id = '';
+      }
+    }
+    $shipping_country = $dom->createElement('ShippingCountryCode', str_pad($shipping_country_id, 3, "0", STR_PAD_LEFT));
+    $shipping_country = $shippingaddress->appendChild($shipping_country);
+  }
+
+  $paymentmethod = $dom->createElement('PaymentMethod', '');
+  $paymentmethod = $cardholder->appendChild($paymentmethod);
+
+  $payment_type = $dom->createElement('PaymentType', 'CreditCard');
+  $payment_type = $paymentmethod->appendChild($payment_type);
+
+  $creditcard = $dom->createElement('CreditCard', '');
+  $creditcard = $paymentmethod->appendChild($creditcard);
+
+  if ( $pane_values['credit_card']['credit_card']['owner'] != '' ) {
+    $credit_name = $dom->createElement('NameOnCard', substr( $pane_values['credit_card']['credit_card']['owner'], 0, 50));
+    $credit_name = $creditcard->appendChild($credit_name);
+  }
+  else {
+    $nameoncard = !empty($billing_address['name_line']) ? $billing_address['name_line'] : '';
+    if ( $nameoncard != '' ) {
+      $credit_name = $dom->createElement('NameOnCard', substr( $nameoncard, 0, 50));
+      $credit_name = $creditcard->appendChild($credit_name);
+    }
+  }
+
+  $credit_number = $dom->createElement('CardNumber', $pane_values['credit_card']['credit_card']['number']);
+  $credit_number = $creditcard->appendChild($credit_number);
+
+  $credit_cvv = $dom->createElement('Cvv2', $pane_values['credit_card']['credit_card']['code']);
+  $credit_cvv = $creditcard->appendChild($credit_cvv);
+
+  $credit_expdate = $dom->createElement('ExpirationDate', str_pad($pane_values['credit_card']['credit_card']['exp_month'], 2, '0', STR_PAD_LEFT) . "/" . substr($pane_values['credit_card']['credit_card']['exp_year'], 2, 2));
+  $credit_expdate = $creditcard->appendChild($credit_expdate);
+
+  $itemcount = $shipping_count = $discount_count = $shipp_value = $base_price = $tax_value = $tax_calculate = $tax_calculate = $amount_calculate = $shippvalue_calculate = $shipptax_calculate = $discount_calculate = $transaction_discount_calculate = $coupon_discount = 0;
+  $coupon_code_array = array();
+  $itemnames = '';
+
+  $orderitemlist = $dom->createElement('OrderItemList', '');
+  $orderitemlist = $cporder->appendChild($orderitemlist);
+
+  foreach ($order_wrapper->commerce_line_items as $delta => $line_item_wrapper) {
+    if (in_array($line_item_wrapper->type->value(), commerce_product_line_item_types())) {
+      $description[] = round($line_item_wrapper->quantity->value(), 2) . 'x ' . $line_item_wrapper->line_item_label->value();
+      $itemnames .= $line_item_wrapper->line_item_label->value() . ',';
+    }
+  }
+  $orderitem = $dom->createElement('OrderItem', '');
+  $orderitem = $orderitemlist->appendChild($orderitem);
+
+  $itemid = $dom->createElement('ItemID', '1');
+  $itemid = $orderitem->appendChild($itemid);
+
+  $itemname = $dom->createElement('ItemName', substr( $itemnames, 0, 50));
+  $itemname = $orderitem->appendChild($itemname);
+
+  $quntity = $dom->createElement('Quantity', '1');
+  $quntity = $orderitem->appendChild($quntity);
+
+  /*
+  Check whether recurring variable is set or not
+  */
+  $recurring_check = ( isset( $payment_method['settings']['is_recurring'] ) );
+
+  /*
+  Check whether option selected by user is not 'I want to make a recurring payment'
+  */
+  $other_check = ( isset( $pane_values['other'] ) && $pane_values['other']['is_recurring'] == 'recurring' );
+  $amountcharged = $charge['amount'];
+
+  if ( ( $recurring_check ) && ( $other_check ) ) {
+    if ( $pane_values['other']['recurring_method'] == 'Installment' ) {
+      $amountcharged = numberformat( $charge['amount'] / $pane_values['other']['installments'] );
+      $unitprice = $dom->createElement('UnitPrice', safe_number( $amountcharged, $charge['currency_code'] ) );
+      $unitprice = $orderitem->appendChild($unitprice);
+    }
+    else {
+      $unitprice = $dom->createElement('UnitPrice', safe_number( $amountcharged, $charge['currency_code'] ) );
+      $unitprice = $orderitem->appendChild($unitprice);
+    }
+  }
+  else {
+    $unitprice = $dom->createElement('UnitPrice', safe_number( $amountcharged, $charge['currency_code'] ) );
+    $unitprice = $orderitem->appendChild($unitprice);
+  }
+
+  $subtotals = $order_wrapper->commerce_order_total->value();
+
+  $receipt = $dom->createElement('Receipt', '');
+  $receipt = $cporder->appendChild($receipt);
+
+  $recipt_lang = $dom->createElement('Language', 'ENG');
+  $recipt_lang = $receipt->appendChild($recipt_lang);
+
+  if ( $payment_method['settings']['organization_information'] != '' ) {
+    $recipt_org = $dom->createElement('OrganizationInformation', safe_string( $payment_method['settings']['organization_information'] ) );
+    $recipt_org = $receipt->appendChild($recipt_org);
+  }
+
+  if ( $payment_method['settings']['thankyou_message'] != '' ) {
+    $recipt_thanks = $dom->createElement('ThankYouMessage', safe_string( $payment_method['settings']['thankyou_message'] ) );
+    $recipt_thanks = $receipt->appendChild($recipt_thanks);
+  }
+
+  if ( $payment_method['settings']['terms_condition'] != '' ) {
+    $recipt_terms = $dom->createElement('TermsCondition',  safe_string( $payment_method['settings']['terms_condition'] ) );
+    $recipt_terms = $receipt->appendChild($recipt_terms);
+  }
+
+  if ( $payment_method['settings']['email_customer'] ) {
+    $recipt_email = $dom->createElement('EmailNotificationList', '');
+    $recipt_email = $receipt->appendChild($recipt_email);
+
+    $email_note = $dom->createElement('NotificationEmail', $email);
+    $email_note = $recipt_email->appendChild($email_note);
+  }
+
+  $transation = $dom->createElement('Transaction', '');
+  $transation = $cporder->appendChild($transation);
+
+  $trans_type = $dom->createElement('TransactionType', 'Payment');
+  $trans_type = $transation->appendChild($trans_type);
+
+  $trans_desc = $dom->createElement('DynamicDescriptor', 'DynamicDescriptor');
+  $trans_desc = $transation->appendChild($trans_desc);
+
+ /*
+  Check whether recurring variable is set or not
+  */
+  $recurring_check = ( isset( $payment_method['settings']['is_recurring'] ) && ( $payment_method['settings']['is_recurring'] == 1 ) );
+
+  /*
+  Check whether option selected by user is not 'I want to make a recurring payment'
+  */
+  $other_check = ( isset( $pane_values['other'] ) && $pane_values['other']['is_recurring'] == 'recurring' );
+
+  if ( ( $recurring_check ) && ( $other_check ) ) {
+    $trans_recurr = $dom->createElement('Recurring', '');
+    $trans_recurr = $transation->appendChild($trans_recurr);
+
+    if ( $pane_values['other']['installments'] != '' ) {
+      $total_installment = $dom->createElement('Installment', $pane_values['other']['installments']);
+      $total_installment = $trans_recurr->appendChild($total_installment);
+    }
+    else {
+      $total_installment = $dom->createElement('Installment', '999');
+      $total_installment = $trans_recurr->appendChild($total_installment);
+    }
+
+    $total_periodicity = $dom->createElement('Periodicity', $pane_values['other']['periodicity']);
+    $total_periodicity = $trans_recurr->appendChild($total_periodicity);
+
+    $recurring_method = $dom->createElement('RecurringMethod', $pane_values['other']['recurring_method']);
+    $recurring_method = $trans_recurr->appendChild($recurring_method);
+  }
+
+  $trans_totals = $dom->createElement('CurrentTotals', '');
+  $trans_totals = $transation->appendChild($trans_totals);
+
+  $total_amount = $dom->createElement( 'Total', $amountcharged );
+  $total_amount = $trans_totals->appendChild($total_amount);
+
+   $strparam['xml'] = $dom->saveXML();
+   $strparam['totalcharged'] = $amountcharged;
+  // echo $dom->saveXML();
+  // die();
+  return $strparam;
+}
+
+/**
+ * Generates a response codes array for ClickandPledge response.
+ *
+ * @return
+ *   Description for the error code.
+ */
+function commerce_cnp_response_codes() {
+  $responsecodes = array(
+      1001 => 'Internal error. Retry transaction',
+      1002 => 'Error occurred on external gateway please try again',
+      2001 => 'Invalid account information',
+      2002 => 'Transaction total is not correct',
+      2003 => 'Invalid parameters ',
+      2004 => 'Document is not a valid xml file',
+      2005 => 'OrderList can not be empty',
+      2054 => 'Total amount is wrong',
+      2055 => 'AccountGuid is not valid',
+      2056 => 'AccountId is not valid',
+      2057 => 'Username is not valid',
+      2058 => 'Password is not valid',
+      2059 => 'Invalid recurring parameters',
+      2060 => 'Account is disabled',
+      2101 => 'Cardholder information is null',
+      2102 => 'Cardholder information is null',
+      2103 => 'Cardholder information is null',
+      2104 => 'Invalid billing country',
+      2105 => 'Credit Card number is not valid',
+      2106 => 'Cvv2 is blank',
+      2107 => 'Cvv2 length error',
+      2108 => 'Invalid currency code',
+      2109 => 'CreditCard object is null',
+      2110 => 'Invalid card type ',
+      2111 => 'Card type not currently accepted',
+      2112 => 'Card type not currently accepted',
+      2210 => 'Order item list is empty',
+      2212 => 'CurrentTotals is null',
+      2213 => 'CurrentTotals is invalid',
+      2214 => 'TicketList lenght is not equal to quantity',
+      2215 => 'NameBadge lenght is not equal to quantity',
+      2216 => 'Invalid textonticketbody',
+      2217 => 'Invalid textonticketsidebar',
+      2218 => 'Invalid NameBadgeFooter',
+      2304 => 'Shipping CountryCode is invalid',
+      2305 => 'Shipping Address Required',
+      2401 => 'IP address is null',
+      2402 => 'Invalid operation',
+      2501 => 'WID is invalid',
+      2502 => 'Production transaction is not allowed. Contact support for activation.',
+      2601 => 'Invalid character in a Base-64 string',
+      2701 => 'ReferenceTransaction Information Cannot be NULL',
+      2702 => 'Invalid Refrence Transaction Information',
+      2703 => 'Expired credit card',
+      2805 => 'eCheck Account number is invalid',
+      2807 => 'Invalid payment method',
+      2809 => 'Invalid payment method',
+      2811 => 'eCheck payment type is currently not accepted',
+      2812 => 'Invalid check number',
+      3001 => 'Invalid RefrenceTransactionID',
+      3002 => 'Invalid operation for this transaction',
+      4001 => 'Fraud transaction',
+      4002 => 'Duplicate transaction',
+      5001 => 'Declined (general)',
+      5002 => 'Declined (lost or stolen card)',
+      5003 => 'Declined (fraud)',
+      5004 => 'Declined (Card expired)',
+      5005 => 'Declined (Cvv2 is not valid)',
+      5006 => 'Declined (Insufficient fund)',
+      5007 => 'Declined (Invalid credit card number)');
+  return $responsecodes;
+}
+
+/**
+ * This will handle when user select card on file functionality.
+ * @param object $payment_method
+ * @param object $pane_form
+ * @param object $pane_values
+ * @param $order
+ * The order the transaction is on.
+ * @param array $charge
+ * The price array for the charge amount with keys of 'amount' and 'currency'.
+ */
+function commerce_cnp_cim_submit_form_submit($payment_method, $pane_form, $pane_values, $order, $charge) {
+  // First attempt to load the card on file.
+  $card_data = commerce_cardonfile_load($pane_values['cardonfile']);
+
+  // Fail now if it is no longer available or the card is inactive.
+  if (empty($card_data) || $card_data->status == 0) {
+    drupal_set_message(t('The requested card on file is no longer valid.'), 'error');
+    return FALSE;
+  }
+
+  // Extract the Customer Profile and Payment Profile IDs from the remote_id.
+  list($cim_customer_profile_id, $vault_guid, $account_id, $order_number) = explode('|', $card_data->remote_id);
+
+  // If we get a response from the API server...
+  $prepared_xml_array = commerce_cnp_buildxml($payment_method, $pane_form, $pane_values, $order, $charge, $vault_guid, $order_number);
+  $prepared_xml = $prepared_xml_array['xml'];
+
+  // Submit the request to ClickandPledge.
+  $cpresponse = commerce_cnp_request( $prepared_xml );
+
+  if (($cpresponse === FALSE)) {
+    $message =  t('Error: Connection to payment gateway failed - no data returned.');
+    drupal_set_message(t('We are not supporting the currency you working. Please contact administrator.'), 'error');
+    drupal_set_message(check_plain( $message ), 'error');
+    return FALSE;
+  }
+
+  $result_code = $cpresponse->OperationResult->ResultCode;
+  $response_message = $cpresponse->OperationResult->ResultCode . ':' . $cpresponse->OperationResult->AdditionalInfo;
+
+  // Prepare a transaction object to log the API response.
+  $transaction = commerce_payment_transaction_new('cnp_aim', $order->order_id);
+  $transaction->instance_id = $payment_method['instance_id'];
+  // $transaction->amount = $charge['amount'];
+  $transaction->amount = $prepared_xml_array['totalcharged'];
+  $transaction->currency_code = $charge['currency_code'];
+  $transaction->payload[REQUEST_TIME] = $cpresponse;
+
+  $responsecodes = commerce_cnp_response_codes();
+
+  // If we didn't get an approval response code...
+  if ($result_code != '0') {
+    if ( in_array( $result_code, array( 2051, 2052, 2053 ) ) ) {
+      $additional_info = $cpresponse->OperationResult->AdditionalInfo;
+    }
+    else {
+      if ( isset( $responsecodes[$result_code] ) ) {
+        $additional_info = $responsecodes[$result_code];
+      }
+      else {
+        $additional_info = 'Unknown error';
+      }
+    }
+
+    $response_message = $result_code . ':' . $additional_info;
+
+    // Create a failed transaction with the error message.
+    $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+    $transaction->remote_status = COMMERCE_PAYMENT_STATUS_FAILURE;
+    $transaction->message = t( check_plain( $response_message ) );
+    // Log the trouble string to the watchdog.
+    watchdog('commerce_cnp', $response_message, array(), WATCHDOG_ERROR);
+  }
+  else {
+    $vault_guid = $cpresponse->OperationResult->VaultGUID;
+    $transaction->remote_id = $vault_guid;
+    $transaction->message = t( check_plain( $cpresponse->OperationResult->ResultData ) );
+
+    // For now we are not supporting 'Authorize'
+    $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+    $transaction->remote_status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+  }
+
+  // Save the transaction information.
+  commerce_payment_transaction_save($transaction);
+   // If the payment failed, display an error and rebuild the form.
+  if ($result_code != '0') {
+    drupal_set_message(t('We received the following error processing your card. Please enter you information again or try a different card.'), 'error');
+    drupal_set_message(check_plain( $response_message ), 'error');
+    return FALSE;
+  }
+}
+
+/**
+ * Submits an  API request to ClickandPledge.
+ *
+ * @param $prepared_xml
+ *   The prepared XML for processing ClickandPledge API.
+ * @return Object
+ */
+function commerce_cnp_request( $prepared_xml ) {
+  $connect = array('soap_version' => SOAP_1_1, 'trace' => 1, 'exceptions' => 0);
+  $client = new SoapClient('https://paas.cloud.clickandpledge.com/paymentservice.svc?wsdl', $connect);
+  $params = array( 'instruction' => $prepared_xml );
+
+  $cpfresponse = $client->Operation( $params );
+  return $cpfresponse;
+}

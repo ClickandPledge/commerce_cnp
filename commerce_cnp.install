@@ -1,0 +1,30 @@
+<?php
+
+/**
+ * @file
+ * Ensures users have SOAP enabled prior to installation.
+ */
+
+/**
+ * Implementation of hook_requirements().
+ */
+function commerce_cnp_requirements($phase) {
+
+  $t = get_t();
+  $has_url = '';
+  $has_url = class_exists("SOAPClient");
+
+  $requirements['commerce_cnp_url'] = array(
+    'title' => $t('SOAPClient'),
+    'value' => $has_curl ? $t('Enabled') : $t('Not found'),
+  );
+
+  if (!$has_url) {
+    $requirements['commerce_cnp_url'] += array(
+      'severity' => REQUIREMENT_ERROR,
+      'description' => $t("ClickandPledge requires the PHP <a href='!SOAP_Client'>SOAPClient</a> library.", array('!SOAP_Client' => 'http://www.php.net/manual/en/soap.setup.php')),
+    );
+  }
+
+  return $requirements;
+}
