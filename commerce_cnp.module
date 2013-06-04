@@ -850,7 +850,9 @@ function commerce_cnp_buildxml($payment_method, $pane_form, $pane_values, $order
   $cardholder = $cporder->appendChild($cardholder);
 
   $xmlpath = drupal_get_path('module', $payment_method['module']);
-  $separator = substr($xmlpath, -(strlen($payment_method['module'])+1), 1);
+  $xmlparts = explode($payment_method['module'], $xmlpath);
+  $separator = substr($xmlparts[0], -1);
+  //$separator = substr($xmlpath, -(strlen($payment_method['module'])+1), 1);
   $countries = simplexml_load_file( $xmlpath . $separator . 'includes' . $separator . 'Countries.xml' );
 
   // Prepare the billing address for use in the request.
@@ -1573,7 +1575,9 @@ function commerce_cnp_buildxml_admin($payment_method, $pane_form, $pane_values, 
   $cardholder = $cporder->appendChild($cardholder);
 
   $xmlpath = drupal_get_path('module', $payment_method['module']);
-  $separator = substr($xmlpath, -(strlen($payment_method['module'])+1), 1);
+  $xmlparts = explode($payment_method['module'], $xmlpath);
+  $separator = substr($xmlparts[0], -1);
+  //$separator = substr($xmlpath, -(strlen($payment_method['module'])+1), 1);
   $countries = simplexml_load_file( $xmlpath . $separator . 'includes' . $separator . 'Countries.xml' );
 
   // Prepare the billing address for use in the request.
